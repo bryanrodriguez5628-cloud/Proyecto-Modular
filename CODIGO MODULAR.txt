@@ -1,0 +1,387 @@
+#include <Arduino.h>
+
+// Librerías C estándar
+#include <math.h>
+
+// Librerías principales del framework
+#include <Wire.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// Librerías de Sensores
+#include "MAX30105.h"
+// Librería del algoritmo de SpO2 validado
+#include "spo2_algorithm.h" 
+
+// =======================================================================
+// --- PARÁMETROS SENSOR MQ-135 ---
+// =======================================================================
+const float VALOR_RL = 10.0;
+const float CURVA_CO2[2] = {116.6020682, -2.769034857};
+const int PIN_MQ = 4;
+const float RESOLUCION_VOLTAJE = 3.3;
+const int RESOLUCION_ADC = 4095;
+const float FACTOR_CORRECCION = 3.23;
+#define PIN_ALIMENTACION_MQ 9
+float R0 = 0.0; // Resistencia base del sensor
+#define PIN_LED_VERDE_MQ 5
+#define PIN_LED_AMARILLO_MQ 6
+#define PIN_LED_ROJO_MQ 7
+
+// =======================================================================
+// --- PARÁMETROS SENSOR MAX30102 ---
+// =======================================================================
+MAX30105 sensorParticulas; // Objeto del sensor
+#define PIN_SDA 21
+#define PIN_SCL 20
+
+const int32_t longitudBuffer = 100;
+uint32_t bufferIR[longitudBuffer];
+uint32_t bufferRojo[longitudBuffer];
+
+// Variables de estado del algoritmo
+int32_t spo2_calculado = 0;
+int8_t spo2_valido = 0;
+int32_t frecuenciaCardiaca = 0;
+int8_t frecuenciaCardiacaValida = 0;
+
+int indiceBuffer = 0;
+bool bufferInicialEstaLleno = false;
+
+// --- PINES PARA LEDS INDIVIDUALES DEL MAX30102 ---
+#define PIN_LED_ROJO_MAX    15
+#define PIN_LED_AMARILLO_MAX 16
+#define PIN_LED_VERDE_MAX  17
+#define PIN_LED_AZUL_MAX   18
+
+// Variables para parpadeo
+unsigned long ultimoParpadeo = 0;
+bool estadoLedRojo = false;
+
+// =======================================================================
+// --- VARIABLES GLOBALES DE DATOS ---
+// =======================================================================
+float valor_spo2 = 0.0; // Esta variable se actualiza por el algoritmo
+float valor_ppm = 420.0; // Valor inicial por defecto
+
+// =======================================================================
+// --- CONFIGURACIÓN DEL SERVIDOR BLE ---
+// =======================================================================
+BLEServer* pServidor = NULL;
+BLECharacteristic* pCaracteristica = NULL;
+bool dispositivoConectado = false;
+
+#define UUID_SERVICIO        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define UUID_CARACTERISTICA "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+class ManejadorEventosServidor: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServidor) {
+      dispositivoConectado = true;
+    }
+    void onDisconnect(BLEServer* pServidor) {
+      dispositivoConectado = false;
+    }
+};
+
+// =======================================================================
+// --- MANEJO DE TIEMPOS ---
+// =======================================================================
+unsigned long tiempoEnvioBLE = 0;
+const long intervaloEnvioBLE = 2000; // Enviar datos BLE cada 2 segundos
+
+unsigned long tiempoLecturaMQ = 0;
+const long intervaloLecturaMQ = 600000; // Intervalo de lectura: CADA 10 MINUTOS
+const long tiempoCalentamientoMQ = 60000;   // Tiempo de calentamiento: 1 MINUTO
+
+// =======================================================================
+// --- FUNCIONES AUXILIARES MQ-135 ---
+// =======================================================================
+float obtenerResistenciaSensor() {
+  int valorCrudo = analogRead(PIN_MQ);
+  if (valorCrudo == 0) return -1;
+  float voltaje = valorCrudo * (RESOLUCION_VOLTAJE / (float)RESOLUCION_ADC);
+  return VALOR_RL * (RESOLUCION_VOLTAJE - voltaje) / voltaje;
+}
+
+void actualizarLedsMQ(float ppm) {
+  if (ppm > 2000) {
+    digitalWrite(PIN_LED_ROJO_MQ, HIGH);
+    digitalWrite(PIN_LED_AMARILLO_MQ, LOW);
+    digitalWrite(PIN_LED_VERDE_MQ, LOW);
+  } else if (ppm > 1000) {
+    digitalWrite(PIN_LED_ROJO_MQ, LOW);
+    digitalWrite(PIN_LED_AMARILLO_MQ, HIGH);
+    digitalWrite(PIN_LED_VERDE_MQ, LOW);
+  } else {
+    digitalWrite(PIN_LED_ROJO_MQ, LOW);
+    digitalWrite(PIN_LED_AMARILLO_MQ, LOW);
+    digitalWrite(PIN_LED_VERDE_MQ, HIGH);
+  }
+}
+
+// =======================================================================
+// --- FUNCIONES AUXILIARES MAX30102 ---
+// =======================================================================
+void actualizarLedsMAX() {
+    
+    digitalWrite(PIN_LED_AZUL_MAX, LOW); // Apagar el LED azul (no-dedo/calibrando)
+
+    if (!spo2_valido) {
+        // El algoritmo no pudo encontrar un valor (ej. mucho movimiento)
+        unsigned long ahora = millis();
+        if (ahora - ultimoParpadeo >= 300) {
+            ultimoParpadeo = ahora;
+            estadoLedRojo = !estadoLedRojo;
+        }
+        digitalWrite(PIN_LED_ROJO_MAX, estadoLedRojo ? HIGH : LOW);
+        digitalWrite(PIN_LED_AMARILLO_MAX, LOW);
+        digitalWrite(PIN_LED_VERDE_MAX, LOW);
+        return; 
+    }
+
+    // Si llegamos aquí, spo2_valido es true
+    if (valor_spo2 >= 97) { 
+        digitalWrite(PIN_LED_ROJO_MAX, LOW);
+        digitalWrite(PIN_LED_AMARILLO_MAX, LOW);
+        digitalWrite(PIN_LED_VERDE_MAX, HIGH);
+    } else if (valor_spo2 >= 95) { 
+        digitalWrite(PIN_LED_ROJO_MAX, LOW);
+        digitalWrite(PIN_LED_AMARILLO_MAX, HIGH);
+        digitalWrite(PIN_LED_VERDE_MAX, LOW);
+    } else if (valor_spo2 >= 90) { 
+        digitalWrite(PIN_LED_ROJO_MAX, HIGH);
+        digitalWrite(PIN_LED_AMARILLO_MAX, LOW);
+        digitalWrite(PIN_LED_VERDE_MAX, LOW);
+    } else { // Menos de 90
+        unsigned long ahora = millis();
+        if (ahora - ultimoParpadeo >= 300) {
+            ultimoParpadeo = ahora;
+            estadoLedRojo = !estadoLedRojo;
+        }
+        digitalWrite(PIN_LED_ROJO_MAX, estadoLedRojo ? HIGH : LOW);
+        digitalWrite(PIN_LED_AMARILLO_MAX, LOW);
+        digitalWrite(PIN_LED_VERDE_MAX, LOW);
+    }
+}
+
+// =======================================================================
+// --- FUNCIÓN DE MANEJO DEL MAX30102 ---
+// =======================================================================
+void manejarMAX30102() {
+    
+    // 1. ¿Hay un nuevo dato disponible en el sensor?
+    if (sensorParticulas.available() == false) {
+        
+        // Comprobar si el dedo se ha quitado
+        if (sensorParticulas.getIR() < 50000 && bufferInicialEstaLleno) {
+            // El dedo se quitó
+            bufferInicialEstaLleno = false; // Reiniciar el algoritmo
+            indiceBuffer = 0;
+            valor_spo2 = 0.0;       // Poner a cero el valor global
+            spo2_valido = 0;
+            
+            digitalWrite(PIN_LED_AZUL_MAX, HIGH); // Encender LED azul (no-dedo)
+            digitalWrite(PIN_LED_ROJO_MAX, LOW);
+            digitalWrite(PIN_LED_AMARILLO_MAX, LOW);
+            digitalWrite(PIN_LED_VERDE_MAX, LOW);
+        }
+        return; // Salir de la función (no-bloqueante)
+    }
+
+    // 2. Sí hay un dato. Leerlo y guardarlo en el buffer.
+    bufferRojo[indiceBuffer] = sensorParticulas.getRed();
+    bufferIR[indiceBuffer] = sensorParticulas.getIR();
+    sensorParticulas.nextSample(); 
+
+    indiceBuffer++; 
+
+    // 3. ¿Aún estamos llenando el buffer inicial (primeros 4 seg)?
+    if (!bufferInicialEstaLleno) {
+        digitalWrite(PIN_LED_AZUL_MAX, HIGH);
+        digitalWrite(PIN_LED_ROJO_MAX, LOW);
+        digitalWrite(PIN_LED_AMARILLO_MAX, LOW);
+        digitalWrite(PIN_LED_VERDE_MAX, LOW);
+
+        if (indiceBuffer >= longitudBuffer) { 
+            bufferInicialEstaLleno = true;
+            indiceBuffer = longitudBuffer - 25; 
+        }
+        return; // Salir mientras se calibra
+    }
+    
+    // 4. ¿Hemos recogido 25 nuevos datos para la ventana deslizante?
+    if (indiceBuffer >= longitudBuffer) { 
+        
+        // 5. El buffer está listo. Calcular SpO2.
+        maxim_heart_rate_and_oxygen_saturation(bufferIR, longitudBuffer, bufferRojo, &spo2_calculado, &spo2_valido, &frecuenciaCardiaca, &frecuenciaCardiacaValida);
+
+        // 6. Actualizar la variable global 'valor_spo2'
+        if (spo2_valido) {
+            valor_spo2 = spo2_calculado; 
+        } else {
+            valor_spo2 = 0.0; // Marcar como inválido
+        }
+
+        // 7. Actualizar los LEDs
+        actualizarLedsMAX(); 
+
+        // 8. Implementar la "ventana deslizante"
+        for (int i = 0; i < longitudBuffer - 25; i++) {
+            bufferRojo[i] = bufferRojo[i + 25];
+            bufferIR[i] = bufferIR[i + 25];
+        }
+        // Reiniciar el índice a 75
+        indiceBuffer = longitudBuffer - 25;
+    }
+}
+
+
+// =======================================================================
+// --- FUNCIÓN DE CONFIGURACIÓN (SETUP) ---
+// =======================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(3000); // Espera para el monitor serie del ESP32-S3
+  
+  // --- Configurar el pin del MOSFET (empezar apagado) ---
+  pinMode(PIN_ALIMENTACION_MQ, OUTPUT);
+  digitalWrite(PIN_ALIMENTACION_MQ, LOW); 
+  
+  // --- Inicialización de LEDs MQ-135 ---
+  pinMode(PIN_LED_VERDE_MQ, OUTPUT);
+  pinMode(PIN_LED_AMARILLO_MQ, OUTPUT);
+  pinMode(PIN_LED_ROJO_MQ, OUTPUT);
+  
+  // --- LÓGICA DE CALIBRACIÓN DE R0 ---
+  Serial.println("Iniciando calibración de R0 (60 segundos).");
+  Serial.println("¡¡ASEGÚRESE DE QUE EL SENSOR ESTÉ EN AIRE LIMPIO!!");
+  
+  digitalWrite(PIN_ALIMENTACION_MQ, HIGH); // Encender el MOSFET para calentar
+  unsigned long inicioCalibracion = millis();
+  bool estadoLed = true;
+  while (millis() - inicioCalibracion < 60000) {
+      digitalWrite(PIN_LED_AMARILLO_MQ, estadoLed); 
+      estadoLed = !estadoLed;
+      delay(500); 
+  }
+  digitalWrite(PIN_LED_AMARILLO_MQ, LOW); 
+  
+  R0 = obtenerResistenciaSensor();
+  Serial.print("Calibración R0 completa. R0 = ");
+  Serial.println(R0);
+
+  // --- TOMA DE LECTURA INICIAL DE PPM ---
+  Serial.println("Tomando lectura inicial de PPM...");
+  float Rs = obtenerResistenciaSensor();
+  digitalWrite(PIN_ALIMENTACION_MQ, LOW); // ¡Apagar el sensor!
+  Serial.println("MQ-135 apagado. Calibración y lectura inicial completas.");
+  
+  if (R0 > 0 && Rs > 0) {
+      // Fórmula corregida validada
+      float proporcion = Rs / R0; 
+      float ppm_sinCorregir = CURVA_CO2[0] * pow(proporcion, CURVA_CO2[1]);
+      valor_ppm = ppm_sinCorregir * FACTOR_CORRECCION;
+  }
+  
+  actualizarLedsMQ(valor_ppm);
+  Serial.print("PPM inicial: ");
+  Serial.println(valor_ppm);
+
+  tiempoLecturaMQ = millis();
+  
+  // --- Inicialización del MAX30102 ---
+  Wire.begin(PIN_SDA, PIN_SCL);
+  if (!sensorParticulas.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 no encontrado. Deteniendo.");
+    while (1);
+  }
+  // Configuración del sensor a 100Hz y 4 promedios (efectivo 25sps)
+  sensorParticulas.setup(0x1F, 4, 2, 100, 411, 4096); 
+  
+  pinMode(PIN_LED_ROJO_MAX, OUTPUT);
+  pinMode(PIN_LED_AMARILLO_MAX, OUTPUT);
+  pinMode(PIN_LED_VERDE_MAX, OUTPUT);
+  pinMode(PIN_LED_AZUL_MAX, OUTPUT);
+  Serial.println("Sensor MAX30102 inicializado. Coloca el dedo para iniciar.");
+  digitalWrite(PIN_LED_AZUL_MAX, HIGH); // Encender azul (no-dedo) al inicio
+
+  // --- CREAR Y CONFIGURAR EL SERVIDOR BLE ---
+  Serial.println("Iniciando servidor BLE...");
+  BLEDevice::init("Monitor_Asma_ESP32");
+  pServidor = BLEDevice::createServer();
+  pServidor->setCallbacks(new ManejadorEventosServidor());
+  BLEService *pServicio = pServidor->createService(UUID_SERVICIO);
+  pCaracteristica = pServicio->createCharacteristic(
+                       UUID_CARACTERISTICA,
+                       BLECharacteristic::PROPERTY_READ |
+                       BLECharacteristic::PROPERTY_NOTIFY
+                     );
+  pCaracteristica->addDescriptor(new BLE2902());
+  pServicio->start();
+  BLEAdvertising *pAnuncio = BLEDevice::getAdvertising();
+  pAnuncio->addServiceUUID(UUID_SERVICIO);
+  pAnuncio->setScanResponse(true);
+  BLEDevice::startAdvertising();
+  Serial.println("Dispositivo BLE listo y anunciando.");
+  Serial.println("===== ARRANQUE COMPLETO =====");
+}
+
+// =======================================================================
+// --- BUCLE PRINCIPAL (LOOP) ---
+// =======================================================================
+void loop() {
+  unsigned long tiempoActual = millis();
+
+  // --- TAREA 1: Manejar el MAX30102 (Siempre activo) ---
+  manejarMAX30102();
+
+  // --- TAREA 2: Leer el sensor MQ-135 (Cada 10 minutos) ---
+  if (tiempoActual - tiempoLecturaMQ >= intervaloLecturaMQ) {
+    tiempoLecturaMQ = tiempoActual; 
+
+    Serial.println("Han pasado 10 min. Encendiendo MQ-135 para calentamiento (1 min)...");
+    digitalWrite(PIN_ALIMENTACION_MQ, HIGH); // Encender el sensor
+    
+    // Este delay() congelará el MAX30102 y BLE por 1 min,
+    // pero solo ocurre una vez cada 10 minutos.
+    delay(tiempoCalentamientoMQ); 
+
+    Serial.println("Calentamiento completo. Leyendo sensor...");
+    float Rs = obtenerResistenciaSensor();
+    digitalWrite(PIN_ALIMENTACION_MQ, LOW); // ¡Apagar el sensor INMEDIATAMENTE!
+    Serial.println("MQ-135 apagado.");
+
+    if (R0 > 0 && Rs > 0) {
+      // Esta es la fórmula validada que funciona (Rs / R0)
+      float proporcion = Rs / R0; 
+      float ppm_sinCorregir = CURVA_CO2[0] * pow(proporcion, CURVA_CO2[1]);
+      valor_ppm = ppm_sinCorregir * FACTOR_CORRECCION; 
+    }
+
+    actualizarLedsMQ(valor_ppm);
+  }
+
+  // --- TAREA 3: Enviar datos por BLE (Cada 2 segundos) ---
+  if (tiempoActual - tiempoEnvioBLE >= intervaloEnvioBLE) {
+    tiempoEnvioBLE = tiempoActual;
+
+    char bufferDatos[20];
+    sprintf(bufferDatos, "%.2f,%.2f", valor_ppm, valor_spo2); 
+    
+    if (dispositivoConectado) {
+      pCaracteristica->setValue(bufferDatos);
+      pCaracteristica->notify();
+    }
+
+    // --- Imprimir en monitor serie para depuración ---
+    Serial.print("PPM: ");
+    Serial.print(valor_ppm);
+    Serial.print(" (última lectura)");
+    Serial.print(" | SpO2: ");
+    Serial.print(valor_spo2);
+    Serial.print("% | BLE Enviado: ");
+    Serial.println(bufferDatos);
+  }
+}

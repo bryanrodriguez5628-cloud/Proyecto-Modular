@@ -1,0 +1,121 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include "MAX30105.h"       
+#include "spo2_algorithm.h"
+
+// =======================================================================
+// --- PINES ---
+// =======================================================================
+#define SDA_PIN 21 // Tu pin SDA
+#define SCL_PIN 20 // Tu pin SCL
+
+// =======================================================================
+// --- PARÁMETROS DEL ALGORITMO ---
+// =======================================================================
+MAX30105 particleSensor;
+uint32_t irBuffer[100]; // Buffer de datos del LED infrarrojo
+uint32_t redBuffer[100]; // Buffer de datos del LED rojo
+int32_t bufferLength;
+int32_t spo2;
+int8_t validSPO2;
+int32_t heartRate;
+int8_t validHeartRate;
+
+// =======================================================================
+// --- TEMPORIZADOR DE VALIDACIÓN ---
+// =======================================================================
+unsigned long validationMillis = 0;
+const long validationInterval = 15000; // 15 segundos
+
+// =======================================================================
+// --- FUNCIÓN DE CONFIGURACIÓN (SETUP) ---
+// =======================================================================
+void setup() {
+    Serial.begin(115200);
+
+    // Usamos la espera de 3 segundos 
+    delay(3000); 
+
+    Serial.println("--- INICIO DE VALIDACIÓN SpO2 ---");
+    
+    // Iniciar I2C (Comunicación con el sensor)
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Serial.println("Paso 1: I2C (Wire) iniciado en pines 21 y 20.");
+
+    // Inicializar el sensor
+    if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+        Serial.println("¡¡FALLO!! MAX30105 no encontrado.");
+        Serial.println("Revisa las conexiones. Deteniendo.");
+        while (1);
+    }
+    Serial.println("Paso 2: Sensor MAX30105 encontrado.");
+
+    // Configuración del sensor 
+    byte ledBrightness = 60;
+    byte sampleAverage = 4;
+    byte ledMode = 2; // Red + IR
+    byte sampleRate = 100;
+    int pulseWidth = 411;
+    int adcRange = 4096;
+    particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+    Serial.println("Paso 3: Sensor configurado.");
+
+    Serial.println(F(">>> Coloca el dedo y presiona 'Enter' para iniciar la validacion..."));
+    
+    while (Serial.available() == 0) ; // Esperar input del usuario
+    Serial.read(); // Limpiar el buffer
+    
+    Serial.println(F("Iniciando... Llenando el buffer inicial de 4 segundos..."));
+
+    // Toma 100 muestras iniciales
+    bufferLength = 100; 
+    for (byte i = 0 ; i < bufferLength ; i++) {
+        while (particleSensor.available() == false)
+            particleSensor.check();
+        redBuffer[i] = particleSensor.getRed();
+        irBuffer[i] = particleSensor.getIR();
+        particleSensor.nextSample();
+    }
+    
+    // Calcular el primer valor
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+    
+    Serial.println(F("Validación iniciada. Registrando datos cada 15 segundos."));
+    Serial.println(F("--- INICIO DE DATOS (COPIAR DESDE AQUÍ) ---"));
+    
+    validationMillis = millis();
+}
+
+// =======================================================================
+// --- BUCLE PRINCIPAL (LOOP) ---
+// =======================================================================
+void loop() {
+    // --- TAREA 1: MANTENER EL ALGORITMO CORRIENDO ---
+    // (Mueve 75 muestras antiguas, añade 25 nuevas)
+    for (byte i = 25; i < 100; i++) {
+        redBuffer[i - 25] = redBuffer[i];
+        irBuffer[i - 25] = irBuffer[i];
+    }
+    for (byte i = 75; i < 100; i++) {
+        while (particleSensor.available() == false)
+            particleSensor.check();
+        redBuffer[i] = particleSensor.getRed();
+        irBuffer[i] = particleSensor.getIR();
+        particleSensor.nextSample(); 
+    }
+    // Recalcula SpO2 con los datos actualizados
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+
+    // --- TAREA 2: IMPRIMIR PARA VALIDACIÓN (Cada 15 seg) ---
+    unsigned long currentMillis = millis();
+    if (currentMillis - validationMillis >= validationInterval) {
+        validationMillis = currentMillis; 
+
+        // Imprime el valor de SpO2 solo si es válido
+        if (validSPO2) {
+            Serial.println(spo2);
+        } else {
+            Serial.println(0.0); // Imprime 0 si no hay dedo o la señal es mala
+        }
+    }
+}

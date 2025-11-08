@@ -1,0 +1,142 @@
+#include <Arduino.h>
+#include <math.h>
+#include <Wire.h>
+
+// =======================================================================
+// --- PARÁMETROS SENSOR MQ-135 ---
+// =======================================================================
+const float RL_VALUE = 10.0;
+const float CO2_CURVE[2] = {116.6020682, -2.769034857};
+const int MQ_PIN = 4;
+const float VOLTAGE_RESOLUTION = 3.3;
+const int ADC_RESOLUTION = 4095;
+const float CORRECTION_FACTOR = 3.23;
+
+// --- PIN DE CONTROL DEL MOSFET PARA EL MQ-135 ---
+#define MQ_POWER_PIN 9 // Pin que controla el Gate del MOSFET
+
+// --- CALIBRACIÓN DE R0 ---
+float R0 = 0.0; // Esta variable se recalculará en CADA arranque
+
+// --- PINES DE LEDs MQ-135 ---
+#define MQ_GREEN_LED_PIN 5
+#define MQ_YELLOW_LED_PIN 6
+#define MQ_RED_LED_PIN 7
+
+// =======================================================================
+// --- PARÁMETROS DE LA PRUEBA DE VALIDACIÓN ---
+// =======================================================================
+unsigned long mqReadMillis = 0;
+// Intervalo de prueba: Leer cada 60 segundos
+const long mqReadInterval = 60000; 
+
+// =======================================================================
+// --- FUNCIONES AUXILIARES (DE TU CÓDIGO FINAL) ---
+// =======================================================================
+
+float getSensorResistance() {
+  int rawValue = analogRead(MQ_PIN);
+  if (rawValue == 0) return -1;
+  float voltage = rawValue * (VOLTAGE_RESOLUTION / (float)ADC_RESOLUTION);
+  return RL_VALUE * (VOLTAGE_RESOLUTION - voltage) / voltage;
+}
+
+void updateMQLEDs(float ppm) {
+  if (ppm > 2000) {
+    digitalWrite(MQ_RED_LED_PIN, HIGH);
+    digitalWrite(MQ_YELLOW_LED_PIN, LOW);
+    digitalWrite(MQ_GREEN_LED_PIN, LOW);
+  } else if (ppm > 1000) {
+    digitalWrite(MQ_RED_LED_PIN, LOW);
+    digitalWrite(MQ_YELLOW_LED_PIN, HIGH);
+    digitalWrite(MQ_GREEN_LED_PIN, LOW);
+  } else {
+    digitalWrite(MQ_RED_LED_PIN, LOW);
+    digitalWrite(MQ_YELLOW_LED_PIN, LOW);
+    digitalWrite(MQ_GREEN_LED_PIN, HIGH);
+  }
+}
+
+// =======================================================================
+// --- FUNCIÓN DE CONFIGURACIÓN (SETUP) ---
+// =======================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(3000); // Espera para el monitor serie del ESP32-S3
+  
+  // --- Configurar el pin del MOSFET ---
+  pinMode(MQ_POWER_PIN, OUTPUT);
+  
+  // --- Inicialización de LEDs MQ-135 ---
+  pinMode(MQ_GREEN_LED_PIN, OUTPUT);
+  pinMode(MQ_YELLOW_LED_PIN, OUTPUT);
+  pinMode(MQ_RED_LED_PIN, OUTPUT);
+  
+  // --- LÓGICA DE CALIBRACIÓN DE R0 ---
+  Serial.println("Iniciando calibración de R0 (60 segundos).");
+  Serial.println("¡¡ASEGÚRESE DE QUE EL SENSOR ESTÉ EN AIRE LIMPIO!!");
+  
+  digitalWrite(MQ_POWER_PIN, HIGH); // Encender el MOSFET para calentar
+
+  // Bucle de espera de 60s con parpadeo de LED amarillo para feedback
+  unsigned long calibStart = millis();
+  bool ledState = true;
+  while (millis() - calibStart < 60000) {
+      digitalWrite(MQ_YELLOW_LED_PIN, ledState); 
+      ledState = !ledState;
+      delay(500); // Parpadea cada medio segundo
+  }
+  digitalWrite(MQ_YELLOW_LED_PIN, LOW); // Apaga el LED al terminar
+  
+  // Tomar la lectura de R0 con el sensor ya caliente
+  R0 = getSensorResistance();
+  
+  Serial.print("Calibración R0 completa. R0 = ");
+  Serial.println(R0);
+
+  // NO APAGAMOS EL SENSOR. Lo dejamos encendido
+  // (HIGH) durante toda la prueba.
+  
+  Serial.println("Sensor CALIENTE y estabilizando.");
+  Serial.println("Iniciando Fase 1 (Línea Base). Registrando PPM cada 60s.");
+  Serial.println("--- INICIO DE DATOS ---");
+
+  // Iniciar el temporizador para la primera lectura
+  mqReadMillis = millis();
+}
+
+// =======================================================================
+// --- BUCLE PRINCIPAL (LOOP) ---
+// =======================================================================
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // --- TAREA ÚNICA: Leer el sensor MQ-135 (Cada 60 segundos) ---
+  if (currentMillis - mqReadMillis >= mqReadInterval) {
+    mqReadMillis = currentMillis; 
+
+    // El sensor ya está caliente (nunca se apagó),
+    // así que no necesitamos el 'delay(mqWarmupTime)'.
+    
+    Serial.print("Leyendo... ");
+    
+    float Rs = getSensorResistance();
+    float ppm_value = 0.0; // Valor por defecto
+    
+    if (R0 > 0 && Rs > 0) {
+      // El ratio correcto es Rs / R0 para que la curva
+      // con exponente negativo funcione correctamente.
+      float ratio = Rs / R0; 
+      
+      float ppm_uncorrected = CO2_CURVE[0] * pow(ratio, CO2_CURVE[1]);
+      ppm_value = ppm_uncorrected * CORRECTION_FACTOR; 
+    }
+
+    // Imprimir el valor de PPM para registrarlo en tu hoja de cálculo
+    Serial.print("PPM: ");
+    Serial.println(ppm_value);
+
+    // Actualizar los LEDs del MQ-135
+    updateMQLEDs(ppm_value);
+  }
+}
